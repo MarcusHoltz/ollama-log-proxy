@@ -1,31 +1,35 @@
 FROM python:3.12-slim AS builder
 
-WORKDIR /build
-COPY pyproject.toml README.md ./
-COPY src/ src/
+ARG PROXY_REPO=https://github.com/The-Bash/ollama-log-proxy.git
+ARG PROXY_REF=main
 
-RUN pip install --no-cache-dir build && \
-    python -m build --wheel --outdir dist/
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git patch \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+RUN git clone --depth 1 --branch "$PROXY_REF" "$PROXY_REPO" .
+COPY patches/olm-unraid.patch .
+RUN patch -p1 < olm-unraid.patch \
+ && rm -f olm-unraid.patch
+
+RUN pip install --no-cache-dir build \
+ && python -m build --wheel --outdir /out
 
 FROM python:3.12-slim
 
-RUN groupadd --gid 1000 olp && \
-    useradd --uid 1000 --gid olp --create-home olp
-
 WORKDIR /app
+COPY --from=builder /out/*.whl /tmp/
+RUN pip install --no-cache-dir /tmp/*.whl \
+ && rm -rf /tmp/*.whl
 
-COPY --from=builder /build/dist/*.whl /tmp/
-RUN pip install --no-cache-dir /tmp/*.whl && \
-    rm -rf /tmp/*.whl
+# Runs as root: UnRAID appdata is owned nobody:users, a non-root container
+# cannot write the SQLite DB on the bind mount.
 
-RUN mkdir -p /data && chown olp:olp /data
-
-USER olp
-
+ENV OLP_PORT=11434
+ENV OLP_BACKEND=sqlite
 ENV OLP_DB_PATH=/data/ollama-logs.db
-ENV OLP_PORT=11433
 
-EXPOSE 11433 8080 9090
+EXPOSE 11434 8080 9090
 
 ENTRYPOINT ["ollama-log-proxy"]
-CMD ["--dashboard", "8080", "--metrics-port", "9090"]

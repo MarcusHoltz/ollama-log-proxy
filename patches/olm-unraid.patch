@@ -1,0 +1,467 @@
+diff --git a/src/ollama_log_proxy/backends/sqlite.py b/src/ollama_log_proxy/backends/sqlite.py
+index efa9424..b68e183 100644
+--- a/src/ollama_log_proxy/backends/sqlite.py
++++ b/src/ollama_log_proxy/backends/sqlite.py
+@@ -68,7 +68,9 @@ class SQLiteBackend:
+             )
+             self._conn.commit()
+ 
+-    def query(self, filters: dict) -> list[LogEntry]:
++    def query(
++        self, filters: dict, limit: int | None = None, offset: int = 0
++    ) -> list[LogEntry]:
+         """Query inference logs, optionally filtered by since, model, or endpoint."""
+         clauses = ["request_type = 'inference'"]
+         params: list = []
+@@ -85,6 +87,9 @@ class SQLiteBackend:
+ 
+         where = " AND ".join(clauses)
+         sql = f"SELECT * FROM inference_logs WHERE {where} ORDER BY timestamp DESC"
++        if limit is not None:
++            sql += " LIMIT ? OFFSET ?"
++            params.extend([limit, offset])
+ 
+         with self._lock:
+             cursor = self._conn.execute(sql, params)
+@@ -109,6 +114,28 @@ class SQLiteBackend:
+             )
+         return entries
+ 
++    def count(self, filters: dict) -> int:
++        """Count inference logs matching the given filters."""
++        clauses = ["request_type = 'inference'"]
++        params: list = []
++
++        if "since" in filters:
++            clauses.append("timestamp >= ?")
++            params.append(filters["since"])
++        if "model" in filters:
++            clauses.append("model = ?")
++            params.append(filters["model"])
++        if "endpoint" in filters:
++            clauses.append("endpoint = ?")
++            params.append(filters["endpoint"])
++
++        where = " AND ".join(clauses)
++        with self._lock:
++            cursor = self._conn.execute(
++                f"SELECT COUNT(*) FROM inference_logs WHERE {where}", params
++            )
++            return int(cursor.fetchone()[0])
++
+     def close(self) -> None:
+         """Close the SQLite connection."""
+         self._conn.close()
+diff --git a/src/ollama_log_proxy/cli.py b/src/ollama_log_proxy/cli.py
+index 46c3520..6d26a94 100644
+--- a/src/ollama_log_proxy/cli.py
++++ b/src/ollama_log_proxy/cli.py
+@@ -6,6 +6,7 @@ import argparse
+ import logging
+ import signal
+ import sys
++import threading
+ 
+ from ollama_log_proxy import __version__
+ from ollama_log_proxy.backends import create_backend
+@@ -169,7 +170,8 @@ def _handle_serve(args: argparse.Namespace) -> int:
+ 
+     def _shutdown(signum, frame):
+         log.info("Shutting down...")
+-        proxy.shutdown()
++        # shutdown() must run off the serve_forever() thread or it deadlocks
++        threading.Thread(target=proxy.shutdown, daemon=True).start()
+ 
+     signal.signal(signal.SIGINT, _shutdown)
+     signal.signal(signal.SIGTERM, _shutdown)
+diff --git a/src/ollama_log_proxy/dashboard/index.html b/src/ollama_log_proxy/dashboard/index.html
+index 7087ea2..93d0a52 100644
+--- a/src/ollama_log_proxy/dashboard/index.html
++++ b/src/ollama_log_proxy/dashboard/index.html
+@@ -79,6 +79,18 @@
+         th { color: var(--muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 500; }
+         td { font-variant-numeric: tabular-nums; }
+         .empty { color: var(--muted); text-align: center; padding: 3rem; }
++        .entries-nav { display: flex; align-items: center; gap: 0.75rem; margin: -0.5rem 0 1rem; }
++        .entries-nav button {
++            background: var(--surface);
++            color: var(--text);
++            border: 1px solid var(--border);
++            border-radius: 6px;
++            padding: 0.35rem 0.75rem;
++            cursor: pointer;
++            font-size: 0.85rem;
++        }
++        .entries-nav button:disabled { opacity: 0.4; cursor: default; }
++        .entries-nav span { color: var(--muted); font-size: 0.85rem; }
+         @media (max-width: 768px) {
+             .charts-grid { grid-template-columns: 1fr; }
+             .container { padding: 1rem; }
+@@ -133,11 +145,50 @@
+             </table>
+             <div class="empty" id="empty-state">No inference data yet. Start sending requests through the proxy.</div>
+         </div>
++
++        <div class="table-card">
++            <h2>Recent Requests</h2>
++            <div class="entries-nav">
++                <button id="entries-prev">Prev</button>
++                <span id="entries-range"></span>
++                <button id="entries-next">Next</button>
++            </div>
++            <table>
++                <thead>
++                    <tr>
++                        <th>Time</th>
++                        <th>Source IP</th>
++                        <th>Model</th>
++                        <th>Endpoint</th>
++                        <th>Status</th>
++                        <th>Duration</th>
++                    </tr>
++                </thead>
++                <tbody id="entries-table"></tbody>
++            </table>
++            <div class="empty" id="entries-empty">No requests logged yet.</div>
++        </div>
++
++        <div class="table-card">
++            <h2>Callers</h2>
++            <table>
++                <thead>
++                    <tr>
++                        <th>IP</th>
++                        <th>Requests</th>
++                    </tr>
++                </thead>
++                <tbody id="callers-table"></tbody>
++            </table>
++            <div class="empty" id="callers-empty">No callers yet.</div>
++        </div>
+     </div>
+ 
+     <script>
+         const COLORS = ['#6366f1','#22c55e','#f97316','#ec4899','#06b6d4','#eab308','#8b5cf6','#ef4444'];
+         let tokensChart, requestsChart;
++        const ENTRIES_PER_PAGE = 50;
++        let entriesOffset = 0;
+ 
+         function initCharts() {
+             const defaults = Chart.defaults;
+@@ -176,6 +227,78 @@
+             }
+         }
+ 
++        function esc(v) {
++            return String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
++        }
++
++        function formatDuration(ms) {
++            if (ms >= 1000) return (ms / 1000).toFixed(1) + ' s';
++            return Math.round(ms) + ' ms';
++        }
++
++        function formatTime(iso) {
++            const d = new Date(iso);
++            return isNaN(d) ? esc(iso) : d.toLocaleString();
++        }
++
++        async function fetchEntries() {
++            try {
++                const res = await fetch(`/api/entries?limit=${ENTRIES_PER_PAGE}&offset=${entriesOffset}`);
++                const data = await res.json();
++                updateEntries(data);
++            } catch (e) {
++                console.error('Failed to fetch entries:', e);
++            }
++        }
++
++        function updateEntries(data) {
++            const entries = data.entries || [];
++            const total = data.total || 0;
++            const body = document.getElementById('entries-table');
++            const empty = document.getElementById('entries-empty');
++            const prev = document.getElementById('entries-prev');
++            const next = document.getElementById('entries-next');
++            const range = document.getElementById('entries-range');
++
++            prev.disabled = entriesOffset === 0;
++            if (total === 0) {
++                next.disabled = true;
++                range.textContent = 'No requests logged yet';
++                empty.style.display = 'block';
++                body.innerHTML = '';
++            } else {
++                const start = entriesOffset + 1;
++                const end = Math.min(entriesOffset + entries.length, total);
++                next.disabled = end >= total;
++                range.textContent = `Showing ${start.toLocaleString()} to ${end.toLocaleString()} of ${total.toLocaleString()}`;
++                empty.style.display = 'none';
++                body.innerHTML = entries.map(e => `
++                    <tr>
++                        <td>${formatTime(e.timestamp)}</td>
++                        <td>${esc(e.caller_ip)}</td>
++                        <td>${esc(e.model)}</td>
++                        <td>${esc(e.endpoint)}</td>
++                        <td>${e.status_code}</td>
++                        <td>${formatDuration(e.duration_ms)}</td>
++                    </tr>`).join('');
++            }
++
++            const callers = {};
++            for (const e of entries) {
++                if (e.caller_ip) callers[e.caller_ip] = (callers[e.caller_ip] || 0) + 1;
++            }
++            const callerRows = Object.entries(callers).sort((a, b) => b[1] - a[1]);
++            const cbody = document.getElementById('callers-table');
++            const cempty = document.getElementById('callers-empty');
++            if (callerRows.length === 0) {
++                cempty.style.display = 'block';
++                cbody.innerHTML = '';
++            } else {
++                cempty.style.display = 'none';
++                cbody.innerHTML = callerRows.map(([ip, n]) => `<tr><td>${esc(ip)}</td><td>${n}</td></tr>`).join('');
++            }
++        }
++
+         function updateDashboard(data) {
+             document.getElementById('total-requests').textContent = formatNumber(data.total_requests || 0);
+             document.getElementById('total-tokens').textContent = formatNumber(data.total_tokens || 0);
+@@ -210,7 +333,19 @@
+ 
+         initCharts();
+         fetchStats();
++        fetchEntries();
++        document.getElementById('entries-prev').addEventListener('click', () => {
++            if (entriesOffset >= ENTRIES_PER_PAGE) {
++                entriesOffset -= ENTRIES_PER_PAGE;
++                fetchEntries();
++            }
++        });
++        document.getElementById('entries-next').addEventListener('click', () => {
++            entriesOffset += ENTRIES_PER_PAGE;
++            fetchEntries();
++        });
+         setInterval(fetchStats, 30000);
++        setInterval(fetchEntries, 30000);
+     </script>
+ </body>
+ </html>
+diff --git a/src/ollama_log_proxy/dashboard/server.py b/src/ollama_log_proxy/dashboard/server.py
+index 2708e69..654be78 100644
+--- a/src/ollama_log_proxy/dashboard/server.py
++++ b/src/ollama_log_proxy/dashboard/server.py
+@@ -7,6 +7,7 @@ import threading
+ from http.server import BaseHTTPRequestHandler, HTTPServer
+ from pathlib import Path
+ from typing import Any
++from urllib.parse import parse_qs, urlparse
+ 
+ from ollama_log_proxy.backends import LogBackend
+ from ollama_log_proxy.metrics import MetricsCollector, _check_token
+@@ -31,6 +32,8 @@ def _make_handler(
+                 self._serve_html()
+             elif path == "/api/stats":
+                 self._serve_stats()
++            elif path == "/api/entries":
++                self._serve_entries()
+             else:
+                 self.send_error(404)
+ 
+@@ -43,7 +46,12 @@ def _make_handler(
+             self.wfile.write(content)
+ 
+         def _serve_stats(self) -> None:
+-            stats = collector.get_stats()
++            # Aggregate from the backend so history survives restarts;
++            # upstream only reported since-process in-memory counts.
++            # Fall back to the live collector when nothing is persisted yet.
++            stats = self._backend_stats()
++            if not stats["total_requests"]:
++                stats = collector.get_stats()
+             body = json.dumps(stats).encode("utf-8")
+             self.send_response(200)
+             self.send_header("Content-Type", "application/json")
+@@ -52,6 +60,60 @@ def _make_handler(
+             self.end_headers()
+             self.wfile.write(body)
+ 
++        def _backend_stats(self) -> dict[str, Any]:
++            stats: dict[str, Any] = {
++                "total_requests": 0,
++                "total_tokens": 0,
++                "models": {},
++                "callers": {},
++            }
++            for entry in backend.query({}):
++                stats["total_requests"] += 1
++                stats["total_tokens"] += entry.total_tokens
++                if entry.caller_ip:
++                    stats["callers"][entry.caller_ip] = (
++                        stats["callers"].get(entry.caller_ip, 0) + 1
++                    )
++                model = stats["models"].setdefault(
++                    entry.model, {"prompt": 0, "completion": 0, "requests": 0}
++                )
++                model["prompt"] += entry.prompt_tokens
++                model["completion"] += entry.completion_tokens
++                model["requests"] += 1
++            return stats
++
++        def _serve_entries(self) -> None:
++            # Return the most recent inference requests with per-request
++            # caller IP, paginated so the dashboard can browse history at
++            # volume (this proxy sees thousands of requests a day).
++            params = parse_qs(urlparse(self.path).query)
++            try:
++                limit = min(200, max(1, int(params.get("limit", ["50"])[0])))
++                offset = max(0, int(params.get("offset", ["0"])[0]))
++            except ValueError:
++                self.send_error(400, "Bad Request")
++                return
++
++            count = getattr(backend, "count", None)
++            total = count({}) if callable(count) else len(backend.query({}))
++            try:
++                page = backend.query({}, limit=limit, offset=offset)
++            except TypeError:
++                page = backend.query({})[offset : offset + limit]
++            payload = {
++                "total": total,
++                "limit": limit,
++                "offset": offset,
++                "entries": [entry.to_dict() for entry in page],
++            }
++            body = json.dumps(payload).encode("utf-8")
++            self.send_response(200)
++            self.send_header("Content-Type", "application/json")
++            self.send_header("Content-Length", str(len(body)))
++            self.send_header("Access-Control-Allow-Origin", "*")
++            self.end_headers()
++            self.wfile.write(body)
++
+         def log_message(self, format: str, *args: Any) -> None:
+             pass
+ 
+diff --git a/src/ollama_log_proxy/metrics.py b/src/ollama_log_proxy/metrics.py
+index bbb138d..efe1f0f 100644
+--- a/src/ollama_log_proxy/metrics.py
++++ b/src/ollama_log_proxy/metrics.py
+@@ -143,7 +143,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
+             return
+ 
+         path = self.path.split("?")[0]
+-        if path != "/metrics":
++        if path not in ("/metrics", "/"):
+             self.send_error(404, "Not Found")
+             return
+ 
+diff --git a/src/ollama_log_proxy/parser.py b/src/ollama_log_proxy/parser.py
+index 4c5a4ae..a57c16d 100644
+--- a/src/ollama_log_proxy/parser.py
++++ b/src/ollama_log_proxy/parser.py
+@@ -7,8 +7,16 @@ from dataclasses import dataclass, field
+ from datetime import datetime, timezone
+ from typing import Any
+ 
+-INFERENCE_ENDPOINTS = {"/api/generate", "/api/chat", "/api/embeddings", "/api/embed"}
+-POLL_ENDPOINTS = {"/api/tags", "/api/ps", "/api/version", "/api/show"}
++INFERENCE_ENDPOINTS = {
++    "/api/generate",
++    "/api/chat",
++    "/api/embeddings",
++    "/api/embed",
++    "/v1/chat/completions",
++    "/v1/completions",
++    "/v1/embeddings",
++}
++POLL_ENDPOINTS = {"/api/tags", "/api/ps", "/api/version", "/api/show", "/v1/models"}
+ 
+ 
+ @dataclass
+@@ -110,11 +118,14 @@ def extract_usage_from_response(response_bytes: bytes, endpoint: str) -> tuple[i
+     except json.JSONDecodeError:
+         pass
+ 
+-    # Fall back to line-by-line parsing for ndjson streaming responses
++    # Fall back to line-by-line parsing for ndjson streaming responses and
++    # OpenAI-style SSE lines ("data: {...}").
+     lines = text.split("\n")
+     for line in lines:
+         line = line.strip()
+-        if not line:
++        if line.startswith("data:"):
++            line = line[5:].strip()
++        if not line or line == "[DONE]":
+             continue
+         try:
+             obj = json.loads(line)
+diff --git a/src/ollama_log_proxy/proxy.py b/src/ollama_log_proxy/proxy.py
+index 101129b..dc6e02b 100644
+--- a/src/ollama_log_proxy/proxy.py
++++ b/src/ollama_log_proxy/proxy.py
+@@ -2,10 +2,11 @@
+ 
+ from __future__ import annotations
+ 
++import json
+ import logging
+ import threading
+ import time
+-from http.server import BaseHTTPRequestHandler, HTTPServer
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+ from typing import Any
+ from urllib.error import HTTPError, URLError
+ from urllib.parse import urlparse
+@@ -75,11 +76,42 @@ def _make_handler(
+ 
+             model = extract_model_from_body(body) if body else ""
+ 
++            # OpenAI-compatible streaming omits the usage chunk unless the
++            # client asks for it explicitly, which would log 0 tokens for
++            # every streamed call. Ask on the client's behalf; the extra
++            # trailing chunk is the standard include_usage shape.
++            injected_usage = False
++            if (
++                request_type == "inference"
++                and endpoint in ("/v1/chat/completions", "/v1/completions")
++                and body
++            ):
++                # Best-effort: any weird client body just skips the injection
++                # and is forwarded unchanged.
++                try:
++                    payload = json.loads(body)
++                    stream_options = payload.get("stream_options")
++                    has_usage = isinstance(stream_options, dict) and (
++                        "include_usage" in stream_options
++                    )
++                    if payload.get("stream") and not has_usage:
++                        if isinstance(stream_options, dict):
++                            payload["stream_options"]["include_usage"] = True
++                        else:
++                            payload["stream_options"] = {"include_usage": True}
++                        body = json.dumps(payload).encode("utf-8")
++                        injected_usage = True
++                except Exception as exc:
++                    logger.debug("Skipping include_usage injection: %s", exc)
++
+             # Forward all headers except hop-by-hop
+             headers: dict[str, str] = {}
+             for key, value in self.headers.items():
+                 if key.lower() not in _HOP_BY_HOP:
+                     headers[key] = value
++            headers["Content-Length"] = str(len(body))
++            if injected_usage:
++                logger.debug("Injected stream_options.include_usage for %s", endpoint)
+ 
+             # Set X-Forwarded-For: preserve existing chain, append direct peer
+             caller_ip = _get_caller_ip(self)
+@@ -223,7 +255,7 @@ class ProxyServer:
+         self.ollama_url = ollama_url
+         self.backend = backend
+         handler = _make_handler(ollama_url, backend, collector, max_request_size)
+-        self._server = HTTPServer((bind, port), handler)
++        self._server = ThreadingHTTPServer((bind, port), handler)
+ 
+     def serve_forever(self) -> None:
+         """Start accepting requests and block until shutdown() is called."""

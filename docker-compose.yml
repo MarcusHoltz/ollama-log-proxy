@@ -1,40 +1,84 @@
 services:
-  ollama:
-    image: ollama/ollama:latest
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama_data:/root/.ollama
-
-  proxy:
+  ollama-log-proxy:
     build: .
-    ports:
-      - "11433:11433"
-      - "8080:8080"
-      - "9090:9090"
+    container_name: ollama-log-proxy
+    restart: unless-stopped
+
     environment:
-      OLP_OLLAMA_URL: http://ollama:11434
+      OLP_PORT: 11434
+      # Point this at a running Ollama server. Default: Ollama on the host.
+      OLP_OLLAMA_URL: ${OLP_OLLAMA_URL:-http://host.docker.internal:11434}
       OLP_BACKEND: sqlite
       OLP_DB_PATH: /data/ollama-logs.db
-    command: ["--dashboard", "8080", "--metrics-port", "9090"]
-    volumes:
-      - proxy_data:/data
-    depends_on:
-      - ollama
+      OLP_DASHBOARD_PORT: 8080
+      OLP_METRICS_PORT: 9090
+      OLP_DASHBOARD_TOKEN: ${OLP_DASHBOARD_TOKEN:-}
+      OLP_METRICS_TOKEN: ${OLP_METRICS_TOKEN:-}
 
-  grafana:
-    image: grafana/grafana:latest
+    # Lets OLP_OLLAMA_URL default to the host where docker runs.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    # Default bridge mode: ports are published on this host, clients use
+    # localhost. On the UnRAID macvlan setup the container has its own LAN
+    # IP, so publishing is not needed - leave this block on the macvlan
+    # restore and use http://<container-ip>:11434 directly.
     ports:
-      - "3000:3000"
-    environment:
-      GF_SECURITY_ADMIN_PASSWORD: admin
-    volumes:
-      - ./grafana:/etc/grafana/provisioning/dashboards
-      - grafana_data:/var/lib/grafana
-    depends_on:
-      - proxy
+      - "11434:11434"
+      - "8080:8080"
+      - "9090:9090"
 
-volumes:
-  ollama_data:
-  proxy_data:
-  grafana_data:
+    # === UnRAID static LAN IP (optional) ===============================
+    # Give the container its own address on a macvlan so it looks like a
+    # normal LAN service and clients only change the IP. Uncomment this
+    # block, the matching networks block at the bottom, and add PROXY_IP
+    # to .env. Remove or ignore the ports block above.
+    # networks:
+    #   br1.224:
+    #     ipv4_address: ${PROXY_IP}
+
+    # === Traefik dashboard (optional) ===================================
+    # Publish the dashboard through an existing Traefik with a wildcard
+    # cert. Uncomment, add DOMAIN/SUBDOMAIN to .env, create the DNS
+    # records, and make sure traefik.docker.network matches your Traefik
+    # network. The API and metrics stay on plain IP:port.
+    # labels:
+    #   - "traefik.enable=true"
+    #   - "traefik.docker.network=br1.224"
+    #   - "traefik.http.services.ollama-dashboard.loadbalancer.server.port=8080"
+    #   - "traefik.http.routers.ollama-dashboard.rule=Host(`ollama-dashboard.${DOMAIN}`) || Host(`ollama-dashboard.${SUBDOMAIN}`)"
+    #   - "traefik.http.routers.ollama-dashboard.service=ollama-dashboard"
+    #   - "traefik.http.routers.ollama-dashboard.entrypoints=websecure"
+    #   - "traefik.http.routers.ollama-dashboard.tls=true"
+    #   - "traefik.http.routers.ollama-dashboard.tls.certresolver=cloudflare"
+    #   - "traefik.http.routers.ollama-dashboard.tls.domains[0].sans=*.${DOMAIN}"
+    #   - "traefik.http.routers.ollama-dashboard.tls.domains[1].sans=*.${SUBDOMAIN}"
+
+    # UnRAID appdata bind mount. Normies: leave the default relative path.
+    volumes:
+      - ./ollama-logs:/data
+    #   - /mnt/user/appdata/ollama-log-proxy:/data
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:11434/api/version',timeout=5).read()"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: 50m
+        max-file: "5"
+
+# === UnRAID macvlan network (optional) ==================================
+# Uncomment with the matching service block above. br1.224 must already
+# exist and the subnet must match your LAN.
+# networks:
+#   br1.224:
+#     external: true
+#     name: br1.224
+#     ipam:
+#       config:
+#         - subnet: 192.0.2.0/24
