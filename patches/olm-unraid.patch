@@ -1,5 +1,5 @@
 diff --git a/src/ollama_log_proxy/backends/sqlite.py b/src/ollama_log_proxy/backends/sqlite.py
-index efa9424..b68e183 100644
+index efa9424..3f7d623 100644
 --- a/src/ollama_log_proxy/backends/sqlite.py
 +++ b/src/ollama_log_proxy/backends/sqlite.py
 @@ -68,7 +68,9 @@ class SQLiteBackend:
@@ -23,7 +23,7 @@ index efa9424..b68e183 100644
  
          with self._lock:
              cursor = self._conn.execute(sql, params)
-@@ -109,6 +114,28 @@ class SQLiteBackend:
+@@ -109,6 +114,130 @@ class SQLiteBackend:
              )
          return entries
  
@@ -48,6 +48,108 @@ index efa9424..b68e183 100644
 +                f"SELECT COUNT(*) FROM inference_logs WHERE {where}", params
 +            )
 +            return int(cursor.fetchone()[0])
++
++    def aggregate(self, bucket: str = "hour") -> dict:
++        """Return series for the dashboard charts across the full log.
++
++        Bucket is "hour", "day", or "week", applied to the stored UTC
++        timestamp text. Items are the time series, caller counts, per-model
++        average duration, status code counts, and endpoint counts.
++        """
++        bucket_exprs = {
++            "hour": "strftime('%Y-%m-%dT%H:00', timestamp)",
++            "day": "strftime('%Y-%m-%d', timestamp)",
++            "week": "strftime('%G-W%V', timestamp)",
++        }
++        if bucket not in bucket_exprs:
++            raise ValueError(f"unknown bucket: {bucket}")
++        expr = bucket_exprs[bucket]
++
++        with self._lock:
++            cursor = self._conn.execute(
++                f"""SELECT {expr} AS bucket, COUNT(*), SUM(total_tokens),
++                    AVG(duration_ms)
++                FROM inference_logs WHERE request_type = 'inference'
++                GROUP BY bucket ORDER BY bucket"""
++            )
++            time_labels: list[str] = []
++            time_requests: list[int] = []
++            time_tokens: list[int] = []
++            time_duration: list[float] = []
++            for row in cursor.fetchall():
++                time_labels.append(row[0])
++                time_requests.append(row[1])
++                time_tokens.append(row[2] or 0)
++                time_duration.append(round(row[3] or 0, 1))
++
++            cursor = self._conn.execute(
++                """SELECT caller_ip, COUNT(*) FROM inference_logs
++                WHERE request_type = 'inference'
++                GROUP BY caller_ip ORDER BY 2 DESC"""
++            )
++            callers = {row[0]: row[1] for row in cursor.fetchall()}
++
++            cursor = self._conn.execute(
++                """SELECT model, AVG(duration_ms), COUNT(*) FROM inference_logs
++                WHERE request_type = 'inference'
++                GROUP BY model ORDER BY 3 DESC"""
++            )
++            model_rows = cursor.fetchall()
++
++            cursor = self._conn.execute(
++                """SELECT status_code, COUNT(*) FROM inference_logs
++                WHERE request_type = 'inference'
++                GROUP BY status_code ORDER BY 2 DESC"""
++            )
++            status = {str(row[0]): row[1] for row in cursor.fetchall()}
++
++            cursor = self._conn.execute(
++                """SELECT endpoint, COUNT(*) FROM inference_logs
++                WHERE request_type = 'inference'
++                GROUP BY endpoint ORDER BY 2 DESC"""
++            )
++            endpoints = {row[0]: row[1] for row in cursor.fetchall()}
++
++            cursor = self._conn.execute(
++                f"""SELECT caller_ip, {expr} AS bucket, COUNT(*)
++                FROM inference_logs WHERE request_type = 'inference'
++                GROUP BY caller_ip, bucket ORDER BY caller_ip, bucket"""
++            )
++            caller_rows: dict[str, dict[str, int]] = {}
++            for ip, bucket_key, count in cursor.fetchall():
++                caller_rows.setdefault(ip, {})[bucket_key] = count
++
++        top_callers = list(callers)[:15]
++        top_series = {
++            ip: [caller_rows[ip].get(label, 0) for label in time_labels]
++            for ip in top_callers
++        }
++        if len(callers) > len(top_callers):
++            top_series["Other"] = [
++                time_requests[i] - sum(top_series[ip][i] for ip in top_callers)
++                for i in range(len(time_requests))
++            ]
++        return {
++            "bucket": bucket,
++            "time": {
++                "labels": time_labels,
++                "requests": time_requests,
++                "tokens": time_tokens,
++                "avg_duration_ms": time_duration,
++            },
++            "callers": callers,
++            "callers_time": {
++                "labels": time_labels,
++                "series": top_series,
++            },
++            "duration_by_model": {
++                "labels": [row[0] for row in model_rows],
++                "avg_ms": [round(row[1] or 0, 1) for row in model_rows],
++                "counts": [row[2] for row in model_rows],
++            },
++            "status": status,
++            "endpoints": endpoints,
++        }
 +
      def close(self) -> None:
          """Close the SQLite connection."""
@@ -75,13 +177,72 @@ index 46c3520..6d26a94 100644
      signal.signal(signal.SIGINT, _shutdown)
      signal.signal(signal.SIGTERM, _shutdown)
 diff --git a/src/ollama_log_proxy/dashboard/index.html b/src/ollama_log_proxy/dashboard/index.html
-index 7087ea2..93d0a52 100644
+index 7087ea2..1e98029 100644
 --- a/src/ollama_log_proxy/dashboard/index.html
 +++ b/src/ollama_log_proxy/dashboard/index.html
-@@ -79,6 +79,18 @@
+@@ -24,7 +24,7 @@
+             color: var(--text);
+             line-height: 1.6;
+         }
+-        .container { max-width: 1200px; margin: 0 auto; padding: 2rem; }
++        .container { max-width: 1600px; margin: 0 auto; padding: 2rem; }
+         header {
+             display: flex;
+             justify-content: space-between;
+@@ -55,16 +55,44 @@
+         .stat-card .value.orange { color: var(--orange); }
+         .charts-grid {
+             display: grid;
+-            grid-template-columns: 1fr 1fr;
++            grid-template-columns: repeat(2, minmax(0, 1fr));
+             gap: 1.5rem;
+             margin-bottom: 2rem;
+         }
++        .charts-toolbar {
++            display: flex;
++            justify-content: space-between;
++            align-items: flex-start;
++            gap: 1rem;
++            flex-wrap: wrap;
++            margin-bottom: 1.5rem;
++            background: var(--surface);
++            border: 1px solid var(--border);
++            border-radius: 12px;
++            padding: 1rem 1.5rem;
++        }
++        .chart-toggles { display: flex; flex-wrap: wrap; gap: 0.4rem 1rem; align-items: center; }
++        .toolbar-label { color: var(--muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; }
++        .chart-toggle {
++            color: var(--muted); font-size: 0.85rem;
++            display: inline-flex; align-items: center; gap: 0.35rem;
++            cursor: pointer;
++        }
++        .chart-toggle:hover { color: var(--text); }
++        .bucket-select { display: flex; align-items: center; gap: 0.5rem; color: var(--muted); font-size: 0.85rem; }
++        .bucket-select select {
++            background: var(--bg); color: var(--text);
++            border: 1px solid var(--border); border-radius: 6px;
++            padding: 0.3rem 0.5rem; font-size: 0.85rem;
++        }
+         .chart-card {
+             background: var(--surface);
+             border: 1px solid var(--border);
+             border-radius: 12px;
+             padding: 1.5rem;
+         }
++        .chart-card.hero { margin-bottom: 1.5rem; }
++        .chart-card.hero canvas { max-height: 360px; }
+         .chart-card h2 { font-size: 1rem; margin-bottom: 1rem; font-weight: 500; }
+         .chart-card canvas { max-height: 300px; }
+         .table-card {
+@@ -79,9 +107,28 @@
          th { color: var(--muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 500; }
          td { font-variant-numeric: tabular-nums; }
          .empty { color: var(--muted); text-align: center; padding: 3rem; }
++        #charts-empty { display: none; }
++        body.no-charts .chart-card.hero,
++        body.no-charts .charts-grid { display: none; }
++        body.no-charts #charts-empty { display: block; }
 +        .entries-nav { display: flex; align-items: center; gap: 0.75rem; margin: -0.5rem 0 1rem; }
 +        .entries-nav button {
 +            background: var(--surface);
@@ -97,7 +258,88 @@ index 7087ea2..93d0a52 100644
          @media (max-width: 768px) {
              .charts-grid { grid-template-columns: 1fr; }
              .container { padding: 1rem; }
-@@ -133,11 +145,50 @@
++            .table-card { overflow-x: auto; }
++            .table-card table { min-width: max-content; }
++            th, td { white-space: nowrap; }
+         }
+     </style>
+ </head>
+@@ -107,12 +154,72 @@
+             </div>
+         </div>
+ 
++        <div class="chart-card hero" id="callers-over-time-card">
++            <h2>Requests by caller over time</h2>
++            <canvas id="callers-over-time"></canvas>
++        </div>
++
++        <div class="empty" id="charts-empty">No inference data yet. Start sending requests through the proxy.</div>
++
++        <div class="charts-toolbar">
++            <div class="chart-toggles" id="chart-toggles">
++                <span class="toolbar-label">Charts</span>
++                <label class="chart-toggle"><input type="checkbox" data-chart="callers-over-time" checked> Callers over time</label>
++                <label class="chart-toggle"><input type="checkbox" data-chart="reqs-time" checked> Requests over time</label>
++                <label class="chart-toggle"><input type="checkbox" data-chart="tokens-time" checked> Tokens over time</label>
++                <label class="chart-toggle"><input type="checkbox" data-chart="latency-time" checked> Latency over time</label>
++                <label class="chart-toggle"><input type="checkbox" data-chart="callers" checked> By caller</label>
++                <label class="chart-toggle"><input type="checkbox" data-chart="duration-model" checked> Duration by model</label>
++                <label class="chart-toggle"><input type="checkbox" data-chart="status" checked> Status</label>
++                <label class="chart-toggle"><input type="checkbox" data-chart="endpoints" checked> By endpoint</label>
++                <label class="chart-toggle"><input type="checkbox" data-chart="tokens-model" checked> Tokens by model</label>
++                <label class="chart-toggle"><input type="checkbox" data-chart="reqs-model" checked> Requests by model</label>
++            </div>
++            <div class="bucket-select">
++                <label for="bucket-select">Time bucket</label>
++                <select id="bucket-select">
++                    <option value="auto">Auto</option>
++                    <option value="hour">1h</option>
++                    <option value="day">24h</option>
++                    <option value="week">1w</option>
++                </select>
++            </div>
++        </div>
++
+         <div class="charts-grid">
+-            <div class="chart-card">
++            <div class="chart-card" id="reqs-time-card">
++                <h2>Requests over time</h2>
++                <canvas id="reqs-time"></canvas>
++            </div>
++            <div class="chart-card" id="tokens-time-card">
++                <h2>Tokens over time</h2>
++                <canvas id="tokens-time"></canvas>
++            </div>
++            <div class="chart-card" id="latency-time-card">
++                <h2>Avg latency over time</h2>
++                <canvas id="latency-time"></canvas>
++            </div>
++            <div class="chart-card" id="callers-card">
++                <h2>Requests by caller</h2>
++                <canvas id="callers"></canvas>
++            </div>
++            <div class="chart-card" id="duration-model-card">
++                <h2>Avg duration by model</h2>
++                <canvas id="duration-model"></canvas>
++            </div>
++            <div class="chart-card" id="status-card">
++                <h2>Request status</h2>
++                <canvas id="status"></canvas>
++            </div>
++            <div class="chart-card" id="endpoints-card">
++                <h2>Requests by endpoint</h2>
++                <canvas id="endpoints"></canvas>
++            </div>
++            <div class="chart-card" id="tokens-model-card">
+                 <h2>Tokens by Model</h2>
+                 <canvas id="tokens-chart"></canvas>
+             </div>
+-            <div class="chart-card">
++            <div class="chart-card" id="reqs-model-card">
+                 <h2>Requests by Model</h2>
+                 <canvas id="requests-chart"></canvas>
+             </div>
+@@ -133,11 +240,51 @@
              </table>
              <div class="empty" id="empty-state">No inference data yet. Start sending requests through the proxy.</div>
          </div>
@@ -141,14 +383,91 @@ index 7087ea2..93d0a52 100644
      </div>
  
      <script>
-         const COLORS = ['#6366f1','#22c55e','#f97316','#ec4899','#06b6d4','#eab308','#8b5cf6','#ef4444'];
+-        const COLORS = ['#6366f1','#22c55e','#f97316','#ec4899','#06b6d4','#eab308','#8b5cf6','#ef4444'];
++        const COLORS = ['#6366f1','#22c55e','#f97316','#ec4899','#06b6d4','#eab308','#8b5cf6','#ef4444','#94a3b8','#10b981','#f59e0b','#3b82f6','#a855f7','#14b8a6','#f43f5e','#84cc16'];
          let tokensChart, requestsChart;
++        const charts = {};
 +        const ENTRIES_PER_PAGE = 50;
 +        let entriesOffset = 0;
  
          function initCharts() {
              const defaults = Chart.defaults;
-@@ -176,6 +227,78 @@
+@@ -158,6 +305,74 @@
+                 data: { labels: [], datasets: [{ data: [], backgroundColor: COLORS }] },
+                 options: { responsive: true, plugins: { legend: { position: 'bottom' } } }
+             });
++            charts['tokens-model'] = tokensChart;
++            charts['reqs-model'] = requestsChart;
++
++            charts['reqs-time'] = buildTimeChart('reqs-time', 'Requests', '#6366f1', true);
++            charts['tokens-time'] = buildTimeChart('tokens-time', 'Tokens', '#22c55e', true);
++            charts['latency-time'] = buildTimeChart('latency-time', 'Avg latency (ms)', '#f97316', true);
++
++            charts['callers'] = new Chart(document.getElementById('callers'), {
++                type: 'bar',
++                data: { labels: [], datasets: [{ label: 'Requests', data: [], backgroundColor: '#06b6d4' }] },
++                options: {
++                    responsive: true, indexAxis: 'y',
++                    plugins: { legend: { display: false } },
++                    scales: { x: { beginAtZero: true, grid: { color: '#2a2d3a' } }, y: { grid: { display: false } } }
++                }
++            });
++
++            charts['duration-model'] = new Chart(document.getElementById('duration-model'), {
++                type: 'bar',
++                data: { labels: [], datasets: [{ label: 'Avg duration (ms)', data: [], backgroundColor: '#8b5cf6' }] },
++                options: {
++                    responsive: true,
++                    plugins: { legend: { display: false } },
++                    scales: { y: { beginAtZero: true, grid: { color: '#2a2d3a' } }, x: { grid: { display: false }, ticks: { maxRotation: 45 } } }
++                }
++            });
++
++            charts['status'] = new Chart(document.getElementById('status'), {
++                type: 'doughnut',
++                data: { labels: [], datasets: [{ data: [], backgroundColor: COLORS }] },
++                options: { responsive: true, plugins: { legend: { position: 'bottom' } } }
++            });
++
++            charts['endpoints'] = new Chart(document.getElementById('endpoints'), {
++                type: 'bar',
++                data: { labels: [], datasets: [{ label: 'Requests', data: [], backgroundColor: '#eab308' }] },
++                options: {
++                    responsive: true,
++                    plugins: { legend: { display: false } },
++                    scales: { y: { beginAtZero: true, grid: { color: '#2a2d3a' } }, x: { grid: { display: false }, ticks: { maxRotation: 45 } } }
++                }
++            });
++
++            charts['callers-over-time'] = new Chart(document.getElementById('callers-over-time'), {
++                type: 'line',
++                data: { labels: [], datasets: [] },
++                options: {
++                    responsive: true,
++                    plugins: { legend: { position: 'bottom' } },
++                    scales: {
++                        y: { beginAtZero: true, grid: { color: '#2a2d3a' } },
++                        x: { grid: { display: false }, ticks: { maxRotation: 45, maxTicksLimit: 12 } }
++                    },
++                    interaction: { mode: 'index', intersect: false }
++                }
++            });
++        }
++
++        function buildTimeChart(id, label, color, fill) {
++            return new Chart(document.getElementById(id), {
++                type: 'line',
++                data: { labels: [], datasets: [{ label, data: [], borderColor: color, backgroundColor: fill ? color + '33' : color, fill: !!fill, tension: 0.3, pointRadius: 2 }] },
++                options: {
++                    responsive: true,
++                    plugins: { legend: { display: false } },
++                    scales: { y: { beginAtZero: true, grid: { color: '#2a2d3a' } }, x: { grid: { display: false }, ticks: { maxRotation: 45, maxTicksLimit: 12 } } }
++                }
++            });
+         }
+ 
+         function formatNumber(n) {
+@@ -176,6 +391,179 @@
              }
          }
  
@@ -207,31 +526,135 @@ index 7087ea2..93d0a52 100644
 +                        <td>${formatDuration(e.duration_ms)}</td>
 +                    </tr>`).join('');
 +            }
++        }
 +
-+            const callers = {};
-+            for (const e of entries) {
-+                if (e.caller_ip) callers[e.caller_ip] = (callers[e.caller_ip] || 0) + 1;
++        async function fetchCharts() {
++            const bucket = localStorage.getItem('olp.bucket') || 'auto';
++            try {
++                const res = await fetch('/api/charts?bucket=' + encodeURIComponent(bucket));
++                const data = await res.json();
++                updateCharts(data);
++            } catch (e) {
++                console.error('Failed to fetch charts:', e);
 +            }
-+            const callerRows = Object.entries(callers).sort((a, b) => b[1] - a[1]);
++        }
++
++        function chartSet(key, labels, values) {
++            const c = charts[key];
++            if (!c) return;
++            c.data.labels = labels;
++            if (c.data.datasets && c.data.datasets.length) c.data.datasets[0].data = values;
++            c.update();
++        }
++
++        function updateCharts(data) {
++            const t = data.time || {};
++            document.body.classList.toggle('no-charts', !(t.labels || []).length);
++            chartSet('reqs-time', t.labels || [], t.requests || []);
++            chartSet('tokens-time', t.labels || [], t.tokens || []);
++            chartSet('latency-time', t.labels || [], t.avg_duration_ms || []);
++
++            const callers = data.callers || {};
++            const callersTime = data.callers_time || {};
++            const sKeys = callersTime.series ? Object.keys(callersTime.series) : [];
++            let sLabels, sCounts;
++            if (sKeys.length > 0) {
++                sLabels = sKeys.map(k => k || '(unknown)');
++                sCounts = sKeys.map(k => callersTime.series[k].reduce((a, b) => a + (b || 0), 0));
++            } else {
++                const sorted = Object.entries(callers).sort((a, b) => b[1] - a[1]);
++                const rest = sorted.slice(10).reduce((sum, [, n]) => sum + n, 0);
++                sLabels = sorted.slice(0, 10).map(([ip]) => ip || '(unknown)');
++                sCounts = sorted.slice(0, 10).map(([, n]) => n);
++                if (rest > 0) { sLabels.push('Other'); sCounts.push(rest); }
++            }
++            chartSet('callers', sLabels.reverse(), sCounts.reverse());
++
++            const dur = data.duration_by_model || {};
++            chartSet('duration-model', dur.labels || [], dur.avg_ms || []);
++
++            const st = data.status || {};
++            const groups = {};
++            for (const [code, n] of Object.entries(st)) {
++                const key = (code[0] || '?') + 'xx';
++                groups[key] = (groups[key] || 0) + n;
++            }
++            chartSet('status', Object.keys(groups), Object.values(groups));
++
++            const ep = data.endpoints || {};
++            const sortedEps = Object.entries(ep).sort((a, b) => b[1] - a[1]);
++            chartSet('endpoints', sortedEps.map(([e]) => e), sortedEps.map(([, n]) => n));
++
++            updateCallersTime(data);
++            updateCallers(callers);
++        }
++
++        function updateCallersTime(data) {
++            const c = charts['callers-over-time'];
++            if (!c) return;
++            const ct = data.callers_time || {};
++            const series = ct.series || {};
++            c.data.labels = ct.labels || (data.time || {}).labels || [];
++            c.data.datasets = Object.entries(series).map(([ip, vals], i) => ({
++                label: ip || '(unknown)', data: vals,
++                borderColor: COLORS[i % COLORS.length],
++                backgroundColor: COLORS[i % COLORS.length],
++                borderWidth: 2,
++                fill: false, tension: 0.3, pointRadius: 1
++            }));
++            c.update();
++        }
++
++        function updateCallers(callers) {
++            const rows = Object.entries(callers).sort((a, b) => b[1] - a[1]);
 +            const cbody = document.getElementById('callers-table');
 +            const cempty = document.getElementById('callers-empty');
-+            if (callerRows.length === 0) {
++            if (rows.length === 0) {
 +                cempty.style.display = 'block';
 +                cbody.innerHTML = '';
 +            } else {
 +                cempty.style.display = 'none';
-+                cbody.innerHTML = callerRows.map(([ip, n]) => `<tr><td>${esc(ip)}</td><td>${n}</td></tr>`).join('');
++                cbody.innerHTML = rows.map(([ip, n]) => `<tr><td>${esc(ip) || '(unknown)'}</td><td>${n}</td></tr>`).join('');
 +            }
++        }
++
++        function initVisibility() {
++            let saved = {};
++            try { saved = JSON.parse(localStorage.getItem('olp.chart-visibility') || '{}'); } catch (e) {}
++            document.querySelectorAll('#chart-toggles input[type="checkbox"]').forEach(cb => {
++                const key = cb.dataset.chart;
++                const visible = saved[key] !== false;
++                cb.checked = visible;
++                document.getElementById(key + '-card').style.display = visible ? '' : 'none';
++                cb.addEventListener('change', () => {
++                    saved[key] = cb.checked;
++                    try { localStorage.setItem('olp.chart-visibility', JSON.stringify(saved)); } catch (e) {}
++                    const card = document.getElementById(key + '-card');
++                    card.style.display = cb.checked ? '' : 'none';
++                    if (cb.checked && charts[key]) charts[key].resize();
++                });
++            });
++
++            const bucketSel = document.getElementById('bucket-select');
++            const savedBucket = localStorage.getItem('olp.bucket') || 'auto';
++            bucketSel.value = savedBucket;
++            bucketSel.addEventListener('change', () => {
++                try { localStorage.setItem('olp.bucket', bucketSel.value); } catch (e) {}
++                fetchCharts();
++            });
 +        }
 +
          function updateDashboard(data) {
              document.getElementById('total-requests').textContent = formatNumber(data.total_requests || 0);
              document.getElementById('total-tokens').textContent = formatNumber(data.total_tokens || 0);
-@@ -210,7 +333,19 @@
+@@ -209,8 +597,23 @@
+         }
  
          initCharts();
++        initVisibility();
          fetchStats();
 +        fetchEntries();
++        fetchCharts();
 +        document.getElementById('entries-prev').addEventListener('click', () => {
 +            if (entriesOffset >= ENTRIES_PER_PAGE) {
 +                entriesOffset -= ENTRIES_PER_PAGE;
@@ -244,14 +667,19 @@ index 7087ea2..93d0a52 100644
 +        });
          setInterval(fetchStats, 30000);
 +        setInterval(fetchEntries, 30000);
++        setInterval(fetchCharts, 30000);
      </script>
  </body>
  </html>
 diff --git a/src/ollama_log_proxy/dashboard/server.py b/src/ollama_log_proxy/dashboard/server.py
-index 2708e69..654be78 100644
+index 2708e69..8a2f24b 100644
 --- a/src/ollama_log_proxy/dashboard/server.py
 +++ b/src/ollama_log_proxy/dashboard/server.py
-@@ -7,6 +7,7 @@ import threading
+@@ -4,15 +4,176 @@ from __future__ import annotations
+ 
+ import json
+ import threading
++from datetime import datetime, timedelta
  from http.server import BaseHTTPRequestHandler, HTTPServer
  from pathlib import Path
  from typing import Any
@@ -259,16 +687,183 @@ index 2708e69..654be78 100644
  
  from ollama_log_proxy.backends import LogBackend
  from ollama_log_proxy.metrics import MetricsCollector, _check_token
-@@ -31,6 +32,8 @@ def _make_handler(
+ 
+ _DASHBOARD_HTML = Path(__file__).parent / "index.html"
+ 
++_TIME_BUCKETS = ("hour", "day", "week")
++
++
++def _pick_bucket(labels: list[str]) -> str:
++    """Choose a bucket size from the span of the log's time labels."""
++    if len(labels) <= 2:
++        return "hour"
++    try:
++        first = datetime.fromisoformat(labels[0])
++        last = datetime.fromisoformat(labels[-1])
++    except (TypeError, ValueError):
++        return "hour"
++    span_hours = (last - first).total_seconds() / 3600
++    if span_hours <= 48:
++        return "hour"
++    if span_hours <= 60 * 24:
++        return "day"
++    return "week"
++
++
++def _bucket_label(timestamp: str, bucket: str) -> str:
++    """Bucket key for a stored UTC timestamp string."""
++    try:
++        dt = datetime.fromisoformat(timestamp)
++    except (TypeError, ValueError):
++        return timestamp
++    if bucket == "hour":
++        return dt.strftime("%Y-%m-%dT%H:00")
++    if bucket == "day":
++        return dt.strftime("%Y-%m-%d")
++    iso_year, week, _ = dt.isocalendar()
++    return f"{iso_year}-W{week:02d}"
++
++
++_TIME_STEP = {"hour": timedelta(hours=1), "day": timedelta(days=1), "week": timedelta(weeks=1)}
++
++
++def _iso_week_start(year: int, week: int) -> datetime:
++    """Monday of the given ISO week, as a naive datetime."""
++    jan4 = datetime(year, 1, 4)
++    return jan4 - timedelta(days=jan4.isoweekday() - 1) + timedelta(weeks=week - 1)
++
++
++def _label_start(label: str, bucket: str) -> datetime:
++    """Start timestamp of a bucket label."""
++    if bucket == "week":
++        year, week = (int(p) for p in label.split("-W"))
++        return _iso_week_start(year, week)
++    return datetime.fromisoformat(label)
++
++
++def _pad_labels(data: dict, bucket: str) -> dict:
++    """Zero-fill missing buckets so time axes are continuous, not holes.
++
++    Mutates and returns the aggregation payload. Buckets between the first
++    and last present label are added with zero counts; per-caller series are
++    realigned to the same label set.
++    """
++    labels = data["time"]["labels"]
++    if len(labels) < 2:
++        return data
++    try:
++        start = _label_start(labels[0], bucket)
++        end = _label_start(labels[-1], bucket)
++    except (TypeError, ValueError, IndexError):
++        return data
++    if end < start:
++        return data
++
++    step = _TIME_STEP[bucket]
++    all_labels = []
++    cur = start
++    while cur <= end:
++        all_labels.append(_bucket_label(cur.isoformat(), bucket))
++        cur += step
++
++    time = data["time"]
++    requests = dict(zip(time["labels"], time["requests"]))
++    tokens = dict(zip(time["labels"], time["tokens"]))
++    avg_ms = dict(zip(time["labels"], time["avg_duration_ms"]))
++    time["labels"] = all_labels
++    time["requests"] = [requests.get(l, 0) for l in all_labels]
++    time["tokens"] = [tokens.get(l, 0) for l in all_labels]
++    time["avg_duration_ms"] = [round(avg_ms.get(l, 0), 1) for l in all_labels]
++
++    series = {}
++    for ip, vals in data["callers_time"]["series"].items():
++        by_label = dict(zip(labels, vals))
++        series[ip] = [by_label.get(l, 0) for l in all_labels]
++    data["callers_time"]["labels"] = all_labels
++    data["callers_time"]["series"] = series
++    return data
++
++
++def _aggregate_entries(entries: list[Any], bucket: str) -> dict[str, Any]:
++    """Python-side aggregation for backends without a native aggregate()."""
++    time_buckets: dict[str, list] = {}
++    callers: dict[str, int] = {}
++    caller_time: dict[str, dict[str, int]] = {}
++    models: dict[str, list] = {}
++    status: dict[str, int] = {}
++    endpoints: dict[str, int] = {}
++
++    for entry in entries:
++        label = _bucket_label(entry.timestamp, bucket)
++        cell = time_buckets.setdefault(label, [0, 0, 0.0])
++        cell[0] += 1
++        cell[1] += entry.total_tokens
++        cell[2] += entry.duration_ms
++        if entry.caller_ip:
++            callers[entry.caller_ip] = callers.get(entry.caller_ip, 0) + 1
++            ip_labels = caller_time.setdefault(entry.caller_ip, {})
++            ip_labels[label] = ip_labels.get(label, 0) + 1
++        model = models.setdefault(entry.model, [0, 0.0])
++        model[0] += 1
++        model[1] += entry.duration_ms
++        status[str(entry.status_code)] = status.get(str(entry.status_code), 0) + 1
++        endpoints[entry.endpoint] = endpoints.get(entry.endpoint, 0) + 1
++
++    time_labels = sorted(time_buckets)
++    model_rows = sorted(models.items(), key=lambda kv: -kv[1][0])
++    top_callers = sorted(
++        caller_time, key=lambda ip: -sum(caller_time[ip].values())
++    )[:15]
++    time_requests = [time_buckets[label][0] for label in time_labels]
++    top_series = {
++        ip: [caller_time[ip].get(label, 0) for label in time_labels]
++        for ip in top_callers
++    }
++    if len(caller_time) > len(top_callers):
++        top_series["Other"] = [
++            time_requests[i] - sum(top_series[ip][i] for ip in top_callers)
++            for i in range(len(time_requests))
++        ]
++    return {
++        "bucket": bucket,
++        "time": {
++            "labels": time_labels,
++            "requests": time_requests,
++            "tokens": [time_buckets[label][1] for label in time_labels],
++            "avg_duration_ms": [
++                round(time_buckets[label][2] / time_buckets[label][0], 1)
++                for label in time_labels
++            ],
++        },
++        "callers": callers,
++        "callers_time": {
++            "labels": time_labels,
++            "series": top_series,
++        },
++        "duration_by_model": {
++            "labels": [model for model, _ in model_rows],
++            "avg_ms": [round(total / count, 1) for _, (count, total) in model_rows],
++            "counts": [count for _, (count, _) in model_rows],
++        },
++        "status": status,
++        "endpoints": endpoints,
++    }
++
+ 
+ def _make_handler(
+     backend: LogBackend,
+@@ -31,6 +192,10 @@ def _make_handler(
                  self._serve_html()
              elif path == "/api/stats":
                  self._serve_stats()
 +            elif path == "/api/entries":
 +                self._serve_entries()
++            elif path == "/api/charts":
++                self._serve_charts()
              else:
                  self.send_error(404)
  
-@@ -43,7 +46,12 @@ def _make_handler(
+@@ -43,7 +208,12 @@ def _make_handler(
              self.wfile.write(content)
  
          def _serve_stats(self) -> None:
@@ -282,7 +877,7 @@ index 2708e69..654be78 100644
              body = json.dumps(stats).encode("utf-8")
              self.send_response(200)
              self.send_header("Content-Type", "application/json")
-@@ -52,6 +60,60 @@ def _make_handler(
+@@ -52,6 +222,100 @@ def _make_handler(
              self.end_headers()
              self.wfile.write(body)
  
@@ -333,6 +928,46 @@ index 2708e69..654be78 100644
 +                "entries": [entry.to_dict() for entry in page],
 +            }
 +            body = json.dumps(payload).encode("utf-8")
++            self.send_response(200)
++            self.send_header("Content-Type", "application/json")
++            self.send_header("Content-Length", str(len(body)))
++            self.send_header("Access-Control-Allow-Origin", "*")
++            self.end_headers()
++            self.wfile.write(body)
++
++        def _serve_charts(self) -> None:
++            # Series for the dashboard charts across the full log history.
++            # Bucket comes from the client or is inferred from the log span.
++            params = parse_qs(urlparse(self.path).query)
++            requested = params.get("bucket", ["auto"])[0]
++            if requested not in ("auto", *_TIME_BUCKETS):
++                self.send_error(400, "Bad Request")
++                return
++
++            if callable(getattr(backend, "aggregate", None)):
++                if requested == "auto":
++                    probe = backend.aggregate("hour")
++                    bucket = _pick_bucket(probe["time"]["labels"])
++                    data = probe if bucket == "hour" else backend.aggregate(bucket)
++                else:
++                    bucket = requested
++                    data = backend.aggregate(requested)
++            else:
++                entries = backend.query({})
++                if requested == "auto":
++                    probe = _aggregate_entries(entries, "hour")
++                    bucket = _pick_bucket(probe["time"]["labels"])
++                    data = (
++                        probe
++                        if bucket == "hour"
++                        else _aggregate_entries(entries, bucket)
++                    )
++                else:
++                    bucket = requested
++                    data = _aggregate_entries(entries, requested)
++
++            data = _pad_labels(data, bucket)
++            body = json.dumps(data).encode("utf-8")
 +            self.send_response(200)
 +            self.send_header("Content-Type", "application/json")
 +            self.send_header("Content-Length", str(len(body)))

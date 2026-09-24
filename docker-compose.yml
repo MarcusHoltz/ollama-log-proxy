@@ -4,6 +4,12 @@ services:
     container_name: ollama-log-proxy
     restart: unless-stopped
 
+    # UID/GID the container runs as. Never root: files written to the bind
+    # mount must stay deletable by the host user. Default 1000:1000 matches
+    # the repo-created ./ollama-logs dir. On UnRAID appdata is nobody:users,
+    # use "99:100" there instead.
+    user: "1000:1000"
+
     environment:
       OLP_PORT: 11434
       # Point this at a running Ollama server. Default: Ollama on the host.
@@ -54,7 +60,10 @@ services:
     #   - "traefik.http.routers.ollama-dashboard.tls.domains[0].sans=*.${DOMAIN}"
     #   - "traefik.http.routers.ollama-dashboard.tls.domains[1].sans=*.${SUBDOMAIN}"
 
-    # UnRAID appdata bind mount. Normies: leave the default relative path.
+    # Log storage. Default: a local ./ollama-logs dir (docker creates it,
+    # but see below). UnRAID: point at /mnt/user/appdata instead.
+    # Create ./ollama-logs yourself first (mkdir), as docker auto-creates
+    # missing bind dirs as root, which the non-root container can't write.
     volumes:
       - ./ollama-logs:/data
     #   - /mnt/user/appdata/ollama-log-proxy:/data

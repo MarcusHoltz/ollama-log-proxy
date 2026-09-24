@@ -54,7 +54,8 @@ curl http://192.0.2.50:11434/v1/chat/completions \
 What you get:
 
     http://192.0.2.50:11434          the API proxy (native + /v1)
-    http://192.0.2.50:8080           dashboard: callers, models, tokens, history
+    http://192.0.2.50:8080           dashboard: callers, models, tokens, history,
+                                    ten toggleable charts (+ hour/day/week zoom)
     http://192.0.2.50:9090/metrics   Prometheus text
 
 Database lives in `./ollama-logs/` and survives restarts. The `/metrics`

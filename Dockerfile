@@ -23,8 +23,15 @@ COPY --from=builder /out/*.whl /tmp/
 RUN pip install --no-cache-dir /tmp/*.whl \
  && rm -rf /tmp/*.whl
 
-# Runs as root: UnRAID appdata is owned nobody:users, a non-root container
-# cannot write the SQLite DB on the bind mount.
+# Run as an unprivileged user so files written to the bind mount land as a
+# normal UID and stay deletable by the host user. Match this user's UID/GID
+# to the appdata folder owner via compose `user:`: 1000:1000 for the default
+# ./ollama-logs mount, 99:100 (nobody:users) on UnRAID appdata. "app" (not
+# proxy: Debian already ships a proxy group).
+RUN groupadd -g 1000 app \
+ && useradd -m -u 1000 -g 1000 app
+
+USER app
 
 ENV OLP_PORT=11434
 ENV OLP_BACKEND=sqlite
